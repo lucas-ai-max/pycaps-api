@@ -152,69 +152,93 @@ def _process_with_pycaps(
     whisper_model: str,
     job_id: str,
 ) -> dict:
-    """Tenta processar via API Python, fallback para CLI."""
+    """Tenta processar via CLI primeiro, fallback para API Python."""
 
-    # --- Tentativa 1: API Python ---
+    # --- Tentativa 1: CLI (mais confiável) ---
+    try:
+        # Descobrir o caminho do executável pycaps
+        import shutil
+        pycaps_bin = shutil.which("pycaps")
+
+        if pycaps_bin:
+            cmd = [
+                pycaps_bin, "render",
+                "--input", input_path,
+                "--output", output_path,
+                "--template", template,
+            ]
+
+            print(f"[{job_id}] Executando CLI: {' '.join(cmd)}")
+
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+
+            print(f"[{job_id}] CLI stdout: {proc.stdout[-300:]}" if proc.stdout else "")
+            print(f"[{job_id}] CLI stderr: {proc.stderr[-300:]}" if proc.stderr else "")
+
+            if proc.returncode == 0 and os.path.exists(output_path):
+                return {"success": True}
+            else:
+                print(f"[{job_id}] CLI falhou (exit {proc.returncode}), tentando API Python...")
+        else:
+            print(f"[{job_id}] Binário 'pycaps' não encontrado no PATH, tentando API Python...")
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "Timeout: processamento excedeu 10 minutos"}
+    except Exception as e:
+        print(f"[{job_id}] CLI falhou com exceção: {e}")
+
+    # --- Tentativa 2: API Python ---
     try:
         print(f"[{job_id}] Processando via API Python...")
-        from pycaps import CapsPipelineBuilder, TemplateLoader
+        from pycaps import CapsPipelineBuilder
 
+        # Tentar com TemplateLoader
         try:
+            from pycaps import TemplateLoader
             builder = (
                 TemplateLoader(template)
                 .with_input_video(input_path)
                 .load(False)
             )
-        except Exception:
-            print(f"[{job_id}] Template '{template}' não encontrado, usando config padrão")
-            builder = CapsPipelineBuilder().with_input_video(input_path)
+            print(f"[{job_id}] Template '{template}' carregado")
+        except Exception as te:
+            print(f"[{job_id}] TemplateLoader falhou ({te}), usando builder padrão")
+            builder = (
+                CapsPipelineBuilder()
+                .with_input_video(input_path)
+            )
 
-        builder.with_transcription_model(whisper_model)
-        builder.with_language(language)
-        builder.with_output_video(output_path)
+        # Configurar output se o método existir
+        if hasattr(builder, 'with_output_video'):
+            builder.with_output_video(output_path)
 
         pipeline = builder.build()
         pipeline.run()
 
+        # Verificar se gerou o output (pode ter nome diferente)
         if os.path.exists(output_path):
             return {"success": True}
-        else:
-            return {"success": False, "error": "Output não gerado via API"}
 
-    except Exception as e:
-        print(f"[{job_id}] API Python falhou: {e}")
-        print(f"[{job_id}] Tentando via CLI...")
-
-    # --- Tentativa 2: CLI ---
-    try:
-        cmd = [
-            sys.executable, "-m", "pycaps", "render",
-            "--input", input_path,
-            "--output", output_path,
-            "--template", template,
-            "--language", language,
-            "--whisper-model", whisper_model,
-        ]
-
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-
-        if proc.returncode == 0 and os.path.exists(output_path):
+        # Procurar qualquer output gerado no mesmo diretório
+        work_dir = Path(input_path).parent
+        generated = list(work_dir.glob("*output*")) + list(work_dir.glob("*captioned*"))
+        if generated:
+            import shutil as sh
+            sh.move(str(generated[0]), output_path)
             return {"success": True}
-        else:
-            return {
-                "success": False,
-                "error": proc.stderr[-500:] if proc.stderr else f"Exit code: {proc.returncode}",
-            }
 
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": "Timeout (>10min)"}
+        return {"success": False, "error": "Pipeline executou mas output não encontrado"}
+
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        error_msg = f"API Python: {type(e).__name__}: {str(e)}"
+        print(f"[{job_id}] {error_msg}")
+        traceback.print_exc()
+        return {"success": False, "error": error_msg}
 
 
 def _cleanup_files(*paths):
