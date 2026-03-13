@@ -28,17 +28,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Instalar dependências Python
+# Instalar dependências Python (pycaps + deps separadas)
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
     python-multipart \
-    "pycaps[base] @ git+https://github.com/francozanardi/pycaps.git"
+    "pycaps @ git+https://github.com/francozanardi/pycaps.git" \
+    openai-whisper \
+    playwright
 
 # Instalar browser do Playwright para renderização CSS
-RUN pip install --no-cache-dir playwright && \
-    python -m playwright install chromium --with-deps || true
+RUN python -m playwright install chromium --with-deps || true
 
 # Variáveis de ambiente
 ENV PYTHONUNBUFFERED=1
