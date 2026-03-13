@@ -28,9 +28,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Instalar dependências Python (pycaps + deps separadas)
+# Instalar PyTorch CPU-only (evita baixar 5GB de CUDA)
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
+    torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Instalar pycaps + whisper + API
+RUN pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
     python-multipart \
