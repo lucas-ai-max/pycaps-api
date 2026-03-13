@@ -1,0 +1,54 @@
+FROM python:3.11-slim
+
+# Instalar FFmpeg e dependências do sistema
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    git \
+    chromium \
+    chromium-driver \
+    fonts-liberation \
+    fonts-noto \
+    libglib2.0-0 \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpango-1.0-0 \
+    libcairo2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Instalar dependências Python
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+    fastapi \
+    uvicorn[standard] \
+    python-multipart \
+    "git+https://github.com/francozanardi/pycaps.git#egg=pycaps[base]"
+
+# Instalar browser do Playwright para renderização CSS
+RUN pip install --no-cache-dir playwright && \
+    python -m playwright install chromium --with-deps || true
+
+# Variáveis de ambiente
+ENV PYTHONUNBUFFERED=1
+ENV CHROMIUM_PATH=/usr/bin/chromium
+
+# Criar diretório de trabalho para vídeos temporários
+RUN mkdir -p /tmp/pycaps-work && chmod 777 /tmp/pycaps-work
+
+# Copiar código da API
+COPY app.py /app/app.py
+
+EXPOSE 8000
+
+# Health check para o Easypanel
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "600"]
