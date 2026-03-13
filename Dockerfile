@@ -27,9 +27,9 @@ WORKDIR /app
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
     fastapi \
-    uvicorn[standard] \
+    "uvicorn[standard]" \
     python-multipart \
-    "git+https://github.com/francozanardi/pycaps.git#egg=pycaps[base]"
+    "pycaps[base] @ git+https://github.com/francozanardi/pycaps.git"
 
 # Instalar browser do Playwright para renderização CSS
 RUN pip install --no-cache-dir playwright && \
