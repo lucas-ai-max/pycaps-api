@@ -11,6 +11,7 @@ Endpoints:
 import json
 import os
 import shutil
+import subprocess
 import time
 import traceback
 import uuid
@@ -456,6 +457,5 @@ class _cleanup_task:
 
 
 if __name__ == "__main__":
-    import subprocess
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
