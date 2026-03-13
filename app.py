@@ -272,13 +272,6 @@ def _build_config(
                 "offset": position_offset,
             },
         },
-        "splitters": [
-            {
-                "type": "limit_by_chars",
-                "min_limit": 10,
-                "max_limit": 20,
-            }
-        ],
     }
 
     # Adicionar language se especificado
@@ -323,21 +316,6 @@ def _process_with_pycaps(
             layout = config.get("layout", {})
             if hasattr(builder, "with_layout"):
                 builder.with_layout(layout)
-
-            # Aplicar splitters
-            splitters = config.get("splitters", [])
-            for sp in splitters:
-                if sp.get("type") == "limit_by_chars":
-                    try:
-                        from pycaps import LimitByCharsSplitter
-                        builder.add_segment_splitter(
-                            LimitByCharsSplitter(
-                                min_limit=sp.get("min_limit", 10),
-                                max_limit=sp.get("max_limit", 20),
-                            )
-                        )
-                    except ImportError:
-                        pass
 
         pipeline = builder.build()
         pipeline.run()
