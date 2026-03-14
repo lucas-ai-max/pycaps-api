@@ -502,3 +502,484 @@ class _cleanup_task:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ENDPOINT /edit — Pipeline completo: cortar silêncio + zoom AI + legendar
+# ═══════════════════════════════════════════════════════════════════
+
+@app.post("/edit")
+async def edit_video(
+    video: UploadFile = File(..., description="Vídeo MP4"),
+    openai_key: str = Form(..., description="API Key da OpenAI"),
+    # Edição
+    silence_threshold: float = Form(default=0.4, description="Duração mín de silêncio pra cortar (segundos)"),
+    silence_db: str = Form(default="-30dB", description="Limiar de volume pra considerar silêncio"),
+    zoom_intensity: float = Form(default=1.15, description="Intensidade do zoom (1.0=sem, 1.15=suave, 1.3=forte)"),
+    # Legendas
+    position: str = Form(default="center"),
+    position_offset: float = Form(default=0.0),
+    font_size: int = Form(default=24),
+    font_weight: int = Form(default=800),
+    font_color: str = Form(default="white"),
+    highlight_color: str = Form(default="white"),
+    highlight_bg: str = Form(default="#22c55e"),
+    text_transform: str = Form(default="uppercase"),
+    stroke_color: str = Form(default="black"),
+    stroke_width: str = Form(default="2px"),
+):
+    """
+    Pipeline completo de edição:
+    1. Detecta silêncios/suspiros via FFmpeg
+    2. Transcreve áudio via Whisper
+    3. GPT-4o analisa e gera decisões de zoom
+    4. FFmpeg corta silêncios + aplica zooms
+    5. Pycaps adiciona legendas estilizadas
+    """
+    job_id = str(uuid.uuid4())[:8]
+    job_dir = WORK_DIR / f"edit_{job_id}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    input_path = job_dir / "input.mp4"
+    edited_path = job_dir / "edited.mp4"
+    final_path = job_dir / "final.mp4"
+    start_time = time.time()
+
+    try:
+        # Salvar vídeo
+        content = await video.read()
+        file_size_mb = len(content) / (1024 * 1024)
+        if file_size_mb > 500:
+            raise HTTPException(status_code=413, detail="Max 500MB")
+        input_path.write_bytes(content)
+        print(f"[{job_id}] EDIT recebido: {file_size_mb:.1f} MB")
+
+        # Obter info do vídeo
+        video_info = _get_video_info(str(input_path))
+        print(f"[{job_id}] Vídeo: {video_info['duration']:.1f}s, {video_info['width']}x{video_info['height']}")
+
+        # 1. Detectar silêncios
+        print(f"[{job_id}] Detectando silêncios...")
+        silences = _detect_silences(str(input_path), silence_db, silence_threshold)
+        print(f"[{job_id}] {len(silences)} silêncios detectados")
+
+        # 2. Transcrever com Whisper
+        print(f"[{job_id}] Transcrevendo com Whisper...")
+        transcript = _transcribe_video(str(input_path), str(job_dir))
+        print(f"[{job_id}] Transcrição: {len(transcript['segments'])} segmentos")
+
+        # 3. IA decide zooms
+        print(f"[{job_id}] Consultando GPT-4o para edição...")
+        edit_plan = _get_ai_edit_plan(
+            transcript=transcript,
+            silences=silences,
+            duration=video_info["duration"],
+            zoom_intensity=zoom_intensity,
+            openai_key=openai_key,
+        )
+        print(f"[{job_id}] Plano: {len(edit_plan.get('cuts', []))} cortes, {len(edit_plan.get('zooms', []))} zooms")
+
+        # 4. FFmpeg aplica edições
+        print(f"[{job_id}] Aplicando edições com FFmpeg...")
+        _apply_edits(
+            input_path=str(input_path),
+            output_path=str(edited_path),
+            cuts=edit_plan.get("cuts", []),
+            zooms=edit_plan.get("zooms", []),
+            video_info=video_info,
+        )
+
+        if not edited_path.exists():
+            raise HTTPException(status_code=500, detail="FFmpeg não gerou vídeo editado")
+        print(f"[{job_id}] Vídeo editado: {edited_path.stat().st_size / 1024 / 1024:.1f} MB")
+
+        # 5. Legendar com pycaps
+        print(f"[{job_id}] Legendando com pycaps...")
+        css_content = _build_css(
+            font_size=font_size, font_color=font_color, font_family="system-ui",
+            font_weight=font_weight, highlight_color=highlight_color,
+            highlight_bg=highlight_bg, text_transform=text_transform,
+            stroke_color=stroke_color, stroke_width=stroke_width,
+        )
+        css_path = job_dir / "style.css"
+        css_path.write_text(css_content)
+
+        config = _build_config(
+            css_path="style.css", position=position, position_offset=position_offset,
+            max_width=0.8, max_lines=2, whisper_model="small", language="pt",
+        )
+        config_json_path = job_dir / "pycaps.template.json"
+        config_json_path.write_text(json.dumps(config, indent=2))
+
+        caption_result = _process_with_pycaps(
+            input_path=str(edited_path),
+            output_path=str(final_path),
+            job_dir=str(job_dir),
+            template="minimalist",
+            job_id=job_id,
+        )
+
+        # Encontrar output final
+        output_file = _find_output(final_path, job_dir)
+        if not output_file or not caption_result.get("success"):
+            # Se legenda falhou, retorna pelo menos o vídeo editado
+            output_file = edited_path
+            print(f"[{job_id}] Legenda falhou, retornando vídeo editado sem legenda")
+
+        duration = round(time.time() - start_time, 2)
+        output_size = output_file.stat().st_size / 1024 / 1024
+        print(f"[{job_id}] CONCLUÍDO em {duration}s → {output_size:.1f} MB")
+
+        return FileResponse(
+            path=str(output_file),
+            media_type="video/mp4",
+            filename=f"editado_{video.filename or 'video.mp4'}",
+            headers={
+                "X-Edit-Duration": str(duration),
+                "X-Edit-Cuts": str(len(edit_plan.get("cuts", []))),
+                "X-Edit-Zooms": str(len(edit_plan.get("zooms", []))),
+                "X-Edit-Job-Id": job_id,
+            },
+            background=_cleanup_task(job_dir),
+        )
+
+    except HTTPException:
+        _cleanup_dir(job_dir)
+        raise
+    except Exception as e:
+        _cleanup_dir(job_dir)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Video Info ───────────────────────────────────────────────────
+
+def _get_video_info(video_path: str) -> dict:
+    """Obtém duração, resolução e fps do vídeo."""
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_format", "-show_streams", video_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    data = json.loads(result.stdout)
+
+    video_stream = next(s for s in data["streams"] if s["codec_type"] == "video")
+    return {
+        "duration": float(data["format"]["duration"]),
+        "width": int(video_stream["width"]),
+        "height": int(video_stream["height"]),
+        "fps": eval(video_stream.get("r_frame_rate", "30/1")),
+    }
+
+
+# ─── Silence Detection ───────────────────────────────────────────
+
+def _detect_silences(video_path: str, silence_db: str, min_duration: float) -> list:
+    """Detecta trechos de silêncio no vídeo via FFmpeg."""
+    cmd = [
+        "ffmpeg", "-i", video_path, "-af",
+        f"silencedetect=noise={silence_db}:d={min_duration}",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    stderr = result.stderr
+
+    silences = []
+    lines = stderr.split("\n")
+    start = None
+    for line in lines:
+        if "silence_start:" in line:
+            try:
+                start = float(line.split("silence_start:")[1].strip().split()[0])
+            except (ValueError, IndexError):
+                start = None
+        elif "silence_end:" in line and start is not None:
+            try:
+                parts = line.split("silence_end:")[1].strip().split()
+                end = float(parts[0])
+                silences.append({"start": round(start, 3), "end": round(end, 3)})
+            except (ValueError, IndexError):
+                pass
+            start = None
+
+    return silences
+
+
+# ─── Whisper Transcription ────────────────────────────────────────
+
+def _transcribe_video(video_path: str, job_dir: str) -> dict:
+    """Transcreve vídeo com Whisper via subprocess."""
+    script = f'''
+import json
+import whisper
+
+model = whisper.load_model("small")
+result = model.transcribe("{video_path}", language="pt", word_timestamps=True)
+
+output = {{
+    "text": result["text"],
+    "segments": []
+}}
+
+for seg in result["segments"]:
+    segment = {{
+        "text": seg["text"].strip(),
+        "start": seg["start"],
+        "end": seg["end"],
+        "words": []
+    }}
+    for w in seg.get("words", []):
+        segment["words"].append({{
+            "word": w["word"].strip(),
+            "start": w["start"],
+            "end": w["end"]
+        }})
+    output["segments"].append(segment)
+
+print(json.dumps(output, ensure_ascii=False))
+'''
+
+    script_path = Path(job_dir) / "transcribe.py"
+    script_path.write_text(script)
+
+    proc = subprocess.run(
+        [sys.executable, str(script_path)],
+        capture_output=True, text=True, timeout=300,
+    )
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"Whisper falhou: {proc.stderr[-300:]}")
+
+    # Pegar última linha com JSON válido
+    for line in reversed(proc.stdout.strip().split("\n")):
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+    raise RuntimeError("Whisper não retornou transcript válido")
+
+
+# ─── AI Edit Planning ────────────────────────────────────────────
+
+def _get_ai_edit_plan(
+    transcript: dict,
+    silences: list,
+    duration: float,
+    zoom_intensity: float,
+    openai_key: str,
+) -> dict:
+    """Pede ao GPT-4o para gerar plano de edição baseado no transcript."""
+    import urllib.request
+
+    prompt = f"""Você é um editor de vídeo profissional para Reels/TikTok/Shorts.
+
+VÍDEO: duração {duration:.1f}s
+
+TRANSCRIÇÃO COM TIMESTAMPS:
+{json.dumps(transcript['segments'], ensure_ascii=False, indent=2)}
+
+SILÊNCIOS DETECTADOS:
+{json.dumps(silences, ensure_ascii=False)}
+
+REGRAS:
+1. CORTES: Confirme quais silêncios devem ser cortados. Mantenha pausas curtas naturais (<0.5s). Corte suspiros, hesitações longas e silêncios mortos.
+2. ZOOMS: Adicione zoom in nos momentos de ênfase, palavras fortes, ou mudanças de energia. Use zoom out suave entre frases pra dar ritmo. Intensidade máxima: {zoom_intensity}x
+3. Cada zoom deve ter: start, end (segundos), scale (1.0 a {zoom_intensity}), type ("in" ou "out")
+4. Não coloque zoom em trechos que serão cortados.
+5. Pense em ritmo — alterne zoom in/out pra manter dinâmico.
+
+Responda APENAS com JSON válido, sem markdown, neste formato:
+{{
+  "cuts": [{{"start": 0.0, "end": 0.0}}],
+  "zooms": [{{"start": 0.0, "end": 0.0, "scale": 1.15, "type": "in"}}]
+}}"""
+
+    body = json.dumps({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 2000,
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {openai_key}",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        print(f"OpenAI falhou: {e}, usando plano padrão")
+        return _default_edit_plan(silences, duration, zoom_intensity)
+
+    content = data["choices"][0]["message"]["content"]
+
+    # Limpar markdown se tiver
+    content = content.strip()
+    if content.startswith("```"):
+        content = "\n".join(content.split("\n")[1:])
+    if content.endswith("```"):
+        content = "\n".join(content.split("\n")[:-1])
+
+    try:
+        plan = json.loads(content)
+        return plan
+    except json.JSONDecodeError:
+        print(f"GPT retornou JSON inválido, usando plano padrão")
+        return _default_edit_plan(silences, duration, zoom_intensity)
+
+
+def _default_edit_plan(silences: list, duration: float, zoom_intensity: float) -> dict:
+    """Plano de edição padrão se a IA falhar."""
+    cuts = [s for s in silences if (s["end"] - s["start"]) > 0.5]
+    zooms = []
+    # Zoom in a cada 3 segundos, alternando
+    t = 0.5
+    zoom_in = True
+    while t < duration - 1:
+        if zoom_in:
+            zooms.append({"start": t, "end": t + 1.0, "scale": zoom_intensity, "type": "in"})
+        else:
+            zooms.append({"start": t, "end": t + 0.5, "scale": 1.0, "type": "out"})
+        t += 3.0
+        zoom_in = not zoom_in
+    return {"cuts": cuts, "zooms": zooms}
+
+
+# ─── FFmpeg Edit Execution ────────────────────────────────────────
+
+def _apply_edits(
+    input_path: str,
+    output_path: str,
+    cuts: list,
+    zooms: list,
+    video_info: dict,
+) -> None:
+    """Aplica cortes de silêncio e zooms via FFmpeg."""
+
+    duration = video_info["duration"]
+    w = video_info["width"]
+    h = video_info["height"]
+
+    # --- Passo 1: Cortar silêncios ---
+    if cuts:
+        # Calcular segmentos de fala (inverso dos cortes)
+        speech_segments = _get_speech_segments(cuts, duration)
+        cut_path = output_path.replace(".mp4", "_cut.mp4")
+
+        # Gerar filtro select pra manter apenas os trechos de fala
+        select_parts = []
+        aselect_parts = []
+        for seg in speech_segments:
+            select_parts.append(f"between(t,{seg['start']},{seg['end']})")
+            aselect_parts.append(f"between(t,{seg['start']},{seg['end']})")
+
+        v_select = "+".join(select_parts)
+        a_select = "+".join(aselect_parts)
+
+        cmd_cut = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-vf", f"select='{v_select}',setpts=N/FRAME_RATE/TB",
+            "-af", f"aselect='{a_select}',asetpts=N/SR/TB",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            cut_path,
+        ]
+
+        proc = subprocess.run(cmd_cut, capture_output=True, text=True, timeout=300)
+        if proc.returncode != 0:
+            print(f"Corte falhou: {proc.stderr[-300:]}")
+            cut_path = input_path  # Fallback: usar original
+    else:
+        cut_path = input_path
+
+    # --- Passo 2: Aplicar zooms ---
+    source_for_zoom = cut_path if cut_path != input_path else input_path
+
+    if zooms:
+        # Gerar expressão de zoom dinâmico
+        # Scale up e crop centrado para simular zoom
+        zoom_expr_parts = []
+        for z in zooms:
+            s, e, scale = z["start"], z["end"], z["scale"]
+            if z["type"] == "in":
+                # Zoom in: de 1.0 até scale
+                zoom_expr_parts.append(
+                    f"if(between(t,{s},{e}),1+({scale}-1)*(t-{s})/({e}-{s})"
+                )
+            else:
+                # Zoom out: de scale até 1.0
+                zoom_expr_parts.append(
+                    f"if(between(t,{s},{e}),{scale}-({scale}-1)*(t-{s})/({e}-{s})"
+                )
+
+        # Construir expressão completa de zoom
+        # Cada zoom fecha com ",1)" — fallback pra 1.0
+        zoom_expr = "1"
+        for z in zooms:
+            s, e, scale = z["start"], z["end"], z["scale"]
+            if z["type"] == "in":
+                zoom_expr = f"if(between(t\\,{s}\\,{e})\\,1+({scale}-1)*(t-{s})/({e}-{s})\\,{zoom_expr})"
+            else:
+                zoom_expr = f"if(between(t\\,{s}\\,{e})\\,{scale}-({scale}-1)*(t-{s})/({e}-{s})\\,{zoom_expr})"
+
+        # Aplicar zoom via scale + crop centralizado
+        vf = (
+            f"scale=iw*({zoom_expr}):ih*({zoom_expr}),"
+            f"crop={w}:{h}"
+        )
+
+        cmd_zoom = [
+            "ffmpeg", "-y", "-i", source_for_zoom,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "copy",
+            output_path,
+        ]
+
+        proc = subprocess.run(cmd_zoom, capture_output=True, text=True, timeout=300)
+        if proc.returncode != 0:
+            print(f"Zoom falhou: {proc.stderr[-300:]}")
+            # Fallback: copiar sem zoom
+            if source_for_zoom != output_path:
+                shutil.copy2(source_for_zoom, output_path)
+    else:
+        # Sem zooms, copiar do passo anterior
+        if source_for_zoom != output_path:
+            shutil.copy2(source_for_zoom, output_path)
+
+    # Limpar intermediário
+    cut_temp = output_path.replace(".mp4", "_cut.mp4")
+    if Path(cut_temp).exists() and cut_temp != output_path:
+        Path(cut_temp).unlink()
+
+
+def _get_speech_segments(cuts: list, duration: float) -> list:
+    """Calcula segmentos de fala (inverso dos cortes de silêncio)."""
+    if not cuts:
+        return [{"start": 0, "end": duration}]
+
+    sorted_cuts = sorted(cuts, key=lambda c: c["start"])
+    segments = []
+    current = 0.0
+
+    for cut in sorted_cuts:
+        if cut["start"] > current + 0.05:
+            segments.append({"start": round(current, 3), "end": round(cut["start"], 3)})
+        current = cut["end"]
+
+    if current < duration - 0.05:
+        segments.append({"start": round(current, 3), "end": round(duration, 3)})
+
+    return segments
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
