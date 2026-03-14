@@ -30,6 +30,43 @@ WORK_DIR = Path("/tmp/pycaps-work")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 
+@app.on_event("startup")
+async def startup_cleanup():
+    """Limpar jobs antigos que sobraram de crashes anteriores."""
+    _cleanup_old_jobs()
+
+
+def _cleanup_old_jobs(max_age_minutes: int = 30):
+    """Remove jobs com mais de X minutos."""
+    now = time.time()
+    for item in WORK_DIR.iterdir():
+        try:
+            age_minutes = (now - item.stat().st_mtime) / 60
+            if age_minutes > max_age_minutes:
+                if item.is_dir():
+                    shutil.rmtree(str(item), ignore_errors=True)
+                else:
+                    item.unlink()
+        except Exception:
+            pass
+
+
+@app.get("/cleanup")
+async def manual_cleanup():
+    """Limpar todos os arquivos temporários manualmente."""
+    count = 0
+    for item in WORK_DIR.iterdir():
+        try:
+            if item.is_dir():
+                shutil.rmtree(str(item), ignore_errors=True)
+            else:
+                item.unlink()
+            count += 1
+        except Exception:
+            pass
+    return {"cleaned": count}
+
+
 # ─── Health & Info ────────────────────────────────────────────────
 
 @app.get("/health")
