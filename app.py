@@ -177,19 +177,19 @@ async def caption_video(
     template: str = Form(default="minimalist"),
     language: str = Form(default="pt"),
     whisper_model: str = Form(default="small"),
-    position: str = Form(default="bottom"),
-    position_offset: float = Form(default=0.0),
-    max_width: float = Form(default=0.8),
+    position: str = Form(default="center"),        # ← corrigido: era "bottom"
+    position_offset: float = Form(default=0.2),    # ← corrigido: era 0.0
+    max_width: float = Form(default=0.85),         # ← corrigido: era 0.8
     max_lines: int = Form(default=2),
-    font_size: int = Form(default=18),
+    font_size: int = Form(default=24),             # ← corrigido: era 18
     font_color: str = Form(default="white"),
     font_family: str = Form(default="system-ui"),
-    font_weight: int = Form(default=700),
-    highlight_color: str = Form(default="#ffc107"),
-    highlight_bg: str = Form(default=""),
+    font_weight: int = Form(default=800),          # ← corrigido: era 700
+    highlight_color: str = Form(default="white"),  # ← corrigido: era "#ffc107"
+    highlight_bg: str = Form(default="#22c55e"),   # ← corrigido: era ""
     text_transform: str = Form(default="uppercase"),
     stroke_color: str = Form(default="black"),
-    stroke_width: str = Form(default="1px"),
+    stroke_width: str = Form(default="2px"),       # ← corrigido: era "1px"
     custom_css: str = Form(default=""),
 ):
     job_id = str(uuid.uuid4())[:8]
