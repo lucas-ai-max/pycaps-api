@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import traceback
 import uuid
@@ -327,75 +328,58 @@ def _process_with_pycaps(
     template: str,
     job_id: str,
 ) -> dict:
-    """Tenta processar via API Python primeiro, fallback para CLI."""
+    """Executa pycaps via script Python em subprocess (evita conflito Playwright+asyncio)."""
 
-    # --- Tentativa 1: API Python (suporta config dinâmico) ---
+    css_path = Path(job_dir) / "style.css"
+    config_path = Path(job_dir) / "pycaps.template.json"
+    script_path = Path(job_dir) / "run_pycaps.py"
+
+    # Gerar script Python que roda fora do asyncio
+    script = f'''
+import sys
+import json
+from pathlib import Path
+
+try:
+    from pycaps import CapsPipelineBuilder, TemplateLoader
+
+    # Carregar template minimalist como base
+    builder = TemplateLoader("{template}").with_input_video("{input_path}").load(False)
+
+    # Sobrescrever CSS se existir customizado
+    css_path = Path("{css_path}")
+    if css_path.exists():
+        css_content = css_path.read_text()
+        builder.add_css_content(css_content)
+
+    # Aplicar layout do config
+    config_path = Path("{config_path}")
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+        layout = config.get("layout", {{}})
+
+        # Aplicar configurações de layout disponíveis
+        if hasattr(builder, "with_layout"):
+            builder.with_layout(layout)
+
+    # Build e executar
+    pipeline = builder.build()
+    pipeline.run()
+    print("SUCCESS")
+
+except Exception as e:
+    print(f"ERROR: {{e}}", file=sys.stderr)
+    import traceback
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+'''
+
+    script_path.write_text(script)
+    print(f"[{job_id}] Executando pycaps via script Python isolado...")
+
     try:
-        print(f"[{job_id}] Processando via API Python...")
-        from pycaps import CapsPipelineBuilder
-
-        config_path = Path(job_dir) / "pycaps.template.json"
-        css_path = Path(job_dir) / "style.css"
-
-        builder = CapsPipelineBuilder()
-        builder.with_input_video(input_path)
-
-        # Carregar CSS gerado
-        if css_path.exists():
-            css_content = css_path.read_text()
-            builder.add_css_content(css_content)
-
-        # Carregar config para layout
-        if config_path.exists():
-            config = json.loads(config_path.read_text())
-
-            # Aplicar layout se o builder suportar
-            layout = config.get("layout", {})
-            if hasattr(builder, "with_layout"):
-                builder.with_layout(layout)
-
-        pipeline = builder.build()
-        pipeline.run()
-
-        if os.path.exists(output_path):
-            return {"success": True}
-
-        # pycaps pode gerar o output com nome diferente
-        return {"success": True, "note": "checking output location"}
-
-    except Exception as e:
-        error_api = f"{type(e).__name__}: {str(e)}"
-        print(f"[{job_id}] API Python falhou: {error_api}")
-        traceback.print_exc()
-
-    # --- Tentativa 2: CLI com template local ---
-    try:
-        pycaps_bin = shutil.which("pycaps")
-        if not pycaps_bin:
-            return {"success": False, "error": f"CLI não encontrado e API falhou: {error_api}"}
-
-        config_path = Path(job_dir) / "pycaps.template.json"
-
-        # Se temos config local, usar como template
-        if config_path.exists():
-            cmd = [
-                pycaps_bin, "render",
-                "--input", input_path,
-                "--output", output_path,
-                "--template", job_dir,  # diretório com pycaps.template.json + style.css
-            ]
-        else:
-            cmd = [
-                pycaps_bin, "render",
-                "--input", input_path,
-                "--output", output_path,
-                "--template", template,
-            ]
-
-        print(f"[{job_id}] Executando CLI: {' '.join(cmd)}")
-
         proc = subprocess.run(
-            cmd,
+            [sys.executable, str(script_path)],
             capture_output=True,
             text=True,
             timeout=600,
@@ -407,18 +391,62 @@ def _process_with_pycaps(
         if proc.stderr:
             print(f"[{job_id}] stderr: {proc.stderr[-500:]}")
 
-        if proc.returncode == 0:
+        # Encontrar output gerado
+        output = _find_output(Path(output_path), Path(job_dir))
+
+        if proc.returncode == 0 and output:
+            # Mover output pro path esperado se necessário
+            if str(output) != output_path:
+                shutil.move(str(output), output_path)
             return {"success": True}
-        else:
-            return {
-                "success": False,
-                "error": f"CLI exit {proc.returncode}: {proc.stderr[-300:] if proc.stderr else 'sem output'}",
-            }
+
+        # Se o script falhou, tentar CLI puro com template padrão
+        print(f"[{job_id}] Script falhou, tentando CLI com template '{template}'...")
 
     except subprocess.TimeoutExpired:
         return {"success": False, "error": "Timeout: processamento excedeu 10 minutos"}
     except Exception as e:
-        return {"success": False, "error": f"CLI: {str(e)}"}
+        print(f"[{job_id}] Script falhou: {e}")
+
+    # --- Fallback: CLI puro com template padrão ---
+    try:
+        pycaps_bin = shutil.which("pycaps")
+        if not pycaps_bin:
+            return {"success": False, "error": "pycaps CLI não encontrado"}
+
+        cmd = [
+            pycaps_bin, "render",
+            "--input", input_path,
+            "--output", output_path,
+            "--template", template,
+        ]
+
+        print(f"[{job_id}] CLI fallback: {' '.join(cmd)}")
+
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+
+        if proc.stdout:
+            print(f"[{job_id}] stdout: {proc.stdout[-500:]}")
+        if proc.stderr:
+            print(f"[{job_id}] stderr: {proc.stderr[-500:]}")
+
+        if proc.returncode == 0 and os.path.exists(output_path):
+            return {"success": True}
+        else:
+            return {
+                "success": False,
+                "error": f"CLI exit {proc.returncode}: {proc.stderr[-300:] if proc.stderr else ''}",
+            }
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "Timeout CLI"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # ─── Helpers ──────────────────────────────────────────────────────
