@@ -103,9 +103,8 @@ async def edit_video(
     silence_db: str = Form(default="-30dB", description="Limiar de volume pra silêncio"),
     add_zooms: bool = Form(default=True, description="Adicionar zooms dinâmicos"),
     zoom_intensity: float = Form(default=1.15, description="Intensidade do zoom"),
-    speed_up: bool = Form(default=False, description="Acelerar vídeo se fala lenta"),
-    speed_factor: float = Form(default=1.15, description="Fator de velocidade (1.1=sutil, 1.2=médio, 1.5=rápido)"),
     custom_prompt: str = Form(default="", description="Instrução extra pra IA editora"),
+    speed_factor: float = Form(default=1.0, description="Velocidade do vídeo. 1.0 = normal, 1.2 = 20% mais rápido, 1.5 = 50% mais rápido. Range: 0.5 a 2.0"),
 ):
     job_id = str(uuid.uuid4())[:8]
     job_dir = WORK_DIR / f"edit_{job_id}"
@@ -119,22 +118,33 @@ async def edit_video(
         # 1. Obter vídeo
         await _save_input(video, video_url, input_path, f"EDIT-{job_id}")
 
-        # 2. Info do vídeo
+        # 2. Aplicar velocidade (antes de tudo para timestamps ficarem corretos)
+        speed_factor = max(0.5, min(2.0, speed_factor))  # clamp 0.5x ~ 2.0x
+        if speed_factor != 1.0:
+            sped_path = job_dir / "sped.mp4"
+            _apply_speed(str(input_path), str(sped_path), speed_factor, job_id)
+            if sped_path.exists():
+                input_path = sped_path
+                print(f"[EDIT-{job_id}] Velocidade {speed_factor}x aplicada")
+            else:
+                print(f"[EDIT-{job_id}] Velocidade falhou, usando original")
+
+        # 3. Info do vídeo
         video_info = _get_video_info(str(input_path))
         duration = video_info["duration"]
         print(f"[EDIT-{job_id}] Vídeo: {duration:.1f}s, {video_info['width']}x{video_info['height']}")
 
-        # 3. Detectar silêncios
+        # 4. Detectar silêncios
         silences = []
         if remove_silence:
             silences = _detect_silences(str(input_path), silence_db, silence_threshold)
             print(f"[EDIT-{job_id}] {len(silences)} silêncios detectados")
 
-        # 4. Transcrever
+        # 5. Transcrever
         transcript = _whisper_transcribe(str(input_path), job_id)
         print(f"[EDIT-{job_id}] Transcrição: {len(transcript.get('segments', []))} segmentos")
 
-        # 5. IA gera plano
+        # 6. IA gera plano
         edit_plan = _ai_edit_plan(
             transcript=transcript, silences=silences, duration=duration,
             zoom_intensity=zoom_intensity, openai_key=openai_api_key,
@@ -146,20 +156,11 @@ async def edit_video(
         zooms = edit_plan.get("zooms", [])
         print(f"[EDIT-{job_id}] Plano: {len(cuts)} cortes, {len(zooms)} zooms")
 
-        # 6. FFmpeg
+        # 7. FFmpeg cortes + zooms
         _apply_edits(str(input_path), str(output_path), cuts, zooms, video_info, job_id)
 
         if not output_path.exists():
             raise HTTPException(status_code=500, detail="FFmpeg não gerou vídeo editado")
-
-        # 7. Acelerar se solicitado
-        if speed_up and speed_factor > 1.0:
-            print(f"[EDIT-{job_id}] Acelerando {speed_factor}x...")
-            sped_path = job_dir / "sped.mp4"
-            _apply_speed(str(output_path), str(sped_path), speed_factor, job_id)
-            if sped_path.exists():
-                output_path.unlink(missing_ok=True)
-                sped_path.rename(output_path)
 
         elapsed = round(time.time() - start_time, 2)
         print(f"[EDIT-{job_id}] Concluído em {elapsed}s → {output_path.stat().st_size/1024/1024:.1f} MB")
@@ -167,7 +168,12 @@ async def edit_video(
         return FileResponse(
             path=str(output_path), media_type="video/mp4",
             filename=f"editado_{video.filename if video and video.filename else 'video.mp4'}",
-            headers={"X-Edit-Duration": str(elapsed), "X-Edit-Cuts": str(len(cuts)), "X-Edit-Zooms": str(len(zooms))},
+            headers={
+                "X-Edit-Duration": str(elapsed),
+                "X-Edit-Cuts": str(len(cuts)),
+                "X-Edit-Zooms": str(len(zooms)),
+                "X-Edit-Speed": str(speed_factor),
+            },
             background=_cleanup_bg(job_dir),
         )
     except HTTPException:
@@ -188,19 +194,19 @@ async def caption_video(
     template: str = Form(default="minimalist"),
     language: str = Form(default="pt"),
     whisper_model: str = Form(default="small"),
-    position: str = Form(default="bottom"),
-    position_offset: float = Form(default=0.0),
-    max_width: float = Form(default=0.8),
+    position: str = Form(default="center"),
+    position_offset: float = Form(default=0.2),
+    max_width: float = Form(default=0.85),
     max_lines: int = Form(default=2),
-    font_size: int = Form(default=18),
+    font_size: int = Form(default=24),
     font_color: str = Form(default="white"),
     font_family: str = Form(default="system-ui"),
-    font_weight: int = Form(default=700),
-    highlight_color: str = Form(default="#ffc107"),
-    highlight_bg: str = Form(default=""),
+    font_weight: int = Form(default=800),
+    highlight_color: str = Form(default="white"),
+    highlight_bg: str = Form(default="#22c55e"),
     text_transform: str = Form(default="uppercase"),
     stroke_color: str = Form(default="black"),
-    stroke_width: str = Form(default="1px"),
+    stroke_width: str = Form(default="2px"),
     custom_css: str = Form(default=""),
 ):
     job_id = str(uuid.uuid4())[:8]
@@ -289,6 +295,49 @@ def _download_file(url, output_path):
         with open(output_path, "wb") as f:
             while chunk := resp.read(8192):
                 f.write(chunk)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# HELPERS — Speed
+# ═══════════════════════════════════════════════════════════════════
+
+def _apply_speed(input_path, output_path, speed_factor, job_id):
+    """
+    Acelera ou desacelera o vídeo mantendo qualidade de áudio.
+    atempo suporta apenas 0.5x ~ 2.0x por estágio — encadeia filtros se necessário.
+    Valores úteis:
+      1.1 = leve aceleração (fala um pouco lenta)
+      1.2 = aceleração suave (fala moderadamente lenta)
+      1.3 = aceleração média
+      1.5 = aceleração forte
+    """
+    # Construir cadeia de filtros atempo (max 2.0x por estágio)
+    atempo_filters = []
+    remaining = speed_factor
+    while remaining > 2.0:
+        atempo_filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        atempo_filters.append("atempo=0.5")
+        remaining /= 0.5
+    atempo_filters.append(f"atempo={remaining:.4f}")
+
+    audio_filter = ",".join(atempo_filters)
+    video_filter = f"setpts={1.0/speed_factor:.4f}*PTS"
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", video_filter,
+        "-af", audio_filter,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path
+    ]
+
+    print(f"[EDIT-{job_id}] Speed FFmpeg: vf={video_filter} | af={audio_filter}")
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0:
+        print(f"[EDIT-{job_id}] Speed falhou: {proc.stderr[-300:]}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -480,34 +529,6 @@ def _apply_edits(input_path, output_path, cuts, zooms, video_info, job_id):
             Path(temp).unlink(missing_ok=True)
     elif not cuts:
         shutil.copy2(input_path, output_path)
-
-
-def _apply_speed(input_path, output_path, factor, job_id):
-    """Acelera vídeo mantendo pitch natural do áudio."""
-    # FFmpeg atempo só aceita entre 0.5 e 2.0
-    # Pra fatores maiores, encadeia filtros
-    atempo_filters = []
-    remaining = factor
-    while remaining > 2.0:
-        atempo_filters.append("atempo=2.0")
-        remaining /= 2.0
-    atempo_filters.append(f"atempo={remaining:.4f}")
-    audio_filter = ",".join(atempo_filters)
-
-    # setpts pra vídeo, atempo pra áudio
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-vf", f"setpts={1/factor:.4f}*PTS",
-        "-af", audio_filter,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        output_path,
-    ]
-
-    print(f"[EDIT-{job_id}] FFmpeg speed: {factor}x")
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    if proc.returncode != 0:
-        print(f"[EDIT-{job_id}] Speed falhou: {proc.stderr[-300:]}")
 
 
 def _speech_segments(cuts, duration):
