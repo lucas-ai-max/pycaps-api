@@ -99,6 +99,508 @@ async def list_templates():
     return {"builtin": builtin, "custom": custom}
 
 
+# ─── Edit endpoint ────────────────────────────────────────────────
+
+@app.post("/edit")
+async def edit_video(
+    video: UploadFile = File(..., description="Arquivo de vídeo (MP4)"),
+    openai_api_key: str = Form(..., description="OpenAI API key"),
+    openai_model: str = Form(default="gpt-4o", description="Modelo OpenAI"),
+    remove_silence: bool = Form(default=True, description="Remover silêncios/suspiros"),
+    silence_threshold: float = Form(default=0.4, description="Duração mínima do silêncio pra cortar (segundos)"),
+    add_zooms: bool = Form(default=True, description="Adicionar zoom in/out dinâmico"),
+    zoom_intensity: float = Form(default=1.15, description="Intensidade do zoom (1.1=sutil, 1.3=forte)"),
+    custom_prompt: str = Form(default="", description="Prompt extra pra IA (ex: 'zoom em momentos emocionais')"),
+):
+    """
+    Edita vídeo automaticamente com IA: remove silêncios e aplica zooms dinâmicos.
+    Retorna o vídeo editado (sem legendas — use /caption depois).
+    """
+    job_id = str(uuid.uuid4())[:8]
+    job_dir = WORK_DIR / f"edit_{job_id}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    input_path = job_dir / "input.mp4"
+    output_path = job_dir / "edited.mp4"
+    start_time = time.time()
+
+    try:
+        # 1. Salvar vídeo
+        content = await video.read()
+        file_size_mb = len(content) / (1024 * 1024)
+        if file_size_mb > 500:
+            raise HTTPException(status_code=413, detail="Arquivo muito grande (max 500MB)")
+        input_path.write_bytes(content)
+        print(f"[EDIT-{job_id}] Recebido: {video.filename} ({file_size_mb:.1f} MB)")
+
+        # 2. Extrair áudio e transcrever com Whisper
+        transcript = _transcribe_video(str(input_path), job_id)
+        if not transcript:
+            raise HTTPException(status_code=500, detail="Falha na transcrição - vídeo sem áudio?")
+        print(f"[EDIT-{job_id}] Transcrito: {len(transcript)} segmentos")
+
+        # 3. Obter duração do vídeo
+        duration = _get_video_duration(str(input_path))
+        print(f"[EDIT-{job_id}] Duração: {duration:.1f}s")
+
+        # 4. IA analisa e gera decisões de edição
+        edit_plan = _ai_generate_edit_plan(
+            transcript=transcript,
+            video_duration=duration,
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
+            remove_silence=remove_silence,
+            silence_threshold=silence_threshold,
+            add_zooms=add_zooms,
+            zoom_intensity=zoom_intensity,
+            custom_prompt=custom_prompt,
+            job_id=job_id,
+        )
+
+        # Salvar plano pra debug
+        plan_path = job_dir / "edit_plan.json"
+        plan_path.write_text(json.dumps(edit_plan, indent=2, ensure_ascii=False))
+        print(f"[EDIT-{job_id}] Plano: {len(edit_plan.get('cuts', []))} cortes, {len(edit_plan.get('zooms', []))} zooms")
+
+        # 5. Executar edições com FFmpeg
+        _execute_edits(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            edit_plan=edit_plan,
+            job_id=job_id,
+        )
+
+        if not output_path.exists():
+            raise HTTPException(status_code=500, detail="Vídeo editado não foi gerado")
+
+        elapsed = round(time.time() - start_time, 2)
+        output_mb = output_path.stat().st_size / (1024 * 1024)
+        print(f"[EDIT-{job_id}] Concluído em {elapsed}s → {output_mb:.1f} MB")
+
+        return FileResponse(
+            path=str(output_path),
+            media_type="video/mp4",
+            filename=f"editado_{video.filename or 'video.mp4'}",
+            headers={
+                "X-Edit-Duration": str(elapsed),
+                "X-Edit-Cuts": str(len(edit_plan.get("cuts", []))),
+                "X-Edit-Zooms": str(len(edit_plan.get("zooms", []))),
+                "X-Edit-Job-Id": job_id,
+            },
+            background=_cleanup_task(job_dir),
+        )
+
+    except HTTPException:
+        _cleanup_dir(job_dir)
+        raise
+    except Exception as e:
+        _cleanup_dir(job_dir)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Transcription ────────────────────────────────────────────────
+
+def _transcribe_video(input_path: str, job_id: str) -> list:
+    """Transcreve vídeo com Whisper via subprocess."""
+    script = f'''
+import json, sys
+try:
+    import whisper
+    model = whisper.load_model("small")
+    result = model.transcribe("{input_path}", language="pt", word_timestamps=True)
+    segments = []
+    for seg in result.get("segments", []):
+        words = []
+        for w in seg.get("words", []):
+            words.append({{"word": w["word"].strip(), "start": round(w["start"], 3), "end": round(w["end"], 3)}})
+        segments.append({{
+            "text": seg["text"].strip(),
+            "start": round(seg["start"], 3),
+            "end": round(seg["end"], 3),
+            "words": words
+        }})
+    print(json.dumps(segments, ensure_ascii=False))
+except Exception as e:
+    print(json.dumps({{"error": str(e)}}), file=sys.stderr)
+    sys.exit(1)
+'''
+    script_path = WORK_DIR / f"transcribe_{job_id}.py"
+    script_path.write_text(script)
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True, text=True, timeout=300,
+        )
+        script_path.unlink(missing_ok=True)
+
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout.strip())
+        else:
+            print(f"[EDIT-{job_id}] Whisper erro: {proc.stderr[-300:]}")
+            return []
+    except Exception as e:
+        print(f"[EDIT-{job_id}] Transcribe falhou: {e}")
+        return []
+
+
+def _get_video_duration(input_path: str) -> float:
+    """Obtém duração do vídeo via ffprobe."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", input_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = json.loads(proc.stdout)
+        return float(info["format"]["duration"])
+    except Exception:
+        return 0.0
+
+
+# ─── AI Edit Planning ─────────────────────────────────────────────
+
+def _ai_generate_edit_plan(
+    transcript: list,
+    video_duration: float,
+    openai_api_key: str,
+    openai_model: str,
+    remove_silence: bool,
+    silence_threshold: float,
+    add_zooms: bool,
+    zoom_intensity: float,
+    custom_prompt: str,
+    job_id: str,
+) -> dict:
+    """Chama GPT-4o para analisar transcript e gerar plano de edição."""
+    import urllib.request
+
+    # Montar transcript resumido pra IA
+    transcript_text = ""
+    for seg in transcript:
+        transcript_text += f"[{seg['start']:.1f}s - {seg['end']:.1f}s] {seg['text']}\n"
+
+    system_prompt = f"""Você é um editor de vídeo profissional para conteúdo de redes sociais (Reels/TikTok/Shorts).
+
+Analise o transcript abaixo e gere um plano de edição em JSON.
+
+REGRAS:
+- Duração total do vídeo: {video_duration:.1f} segundos
+- Zoom intensity máxima: {zoom_intensity}
+- Threshold mínimo de silêncio pra cortar: {silence_threshold}s
+{"- REMOVER silêncios, suspiros, hesitações (éééé, hmmm, pausas longas)" if remove_silence else "- NÃO remover silêncios"}
+{"- ADICIONAR zooms dinâmicos nos momentos de ênfase, palavras fortes, mudanças de energia" if add_zooms else "- NÃO adicionar zooms"}
+{f"- INSTRUÇÃO EXTRA: {custom_prompt}" if custom_prompt else ""}
+
+RETORNE APENAS JSON (sem markdown, sem explicação):
+{{
+  "cuts": [
+    {{"start": 2.1, "end": 3.4, "reason": "silêncio entre frases"}},
+    ...
+  ],
+  "zooms": [
+    {{"start": 1.0, "end": 2.5, "scale": 1.15, "center_x": 0.5, "center_y": 0.4}},
+    ...
+  ]
+}}
+
+- cuts: trechos pra REMOVER do vídeo (silêncios, suspiros)
+- zooms: trechos pra aplicar zoom (scale 1.0=normal, 1.15=sutil, 1.3=forte)
+- center_x/center_y: ponto focal do zoom (0.5,0.4 = rosto centralizado)
+- NÃO sobreponha zooms (um zoom por vez)
+- NÃO corte no meio de palavras
+- Mantenha pelo menos 0.15s de respiro entre cortes"""
+
+    payload = json.dumps({
+        "model": openai_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"TRANSCRIPT:\n{transcript_text}"},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 2000,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {openai_api_key}",
+        },
+    )
+
+    try:
+        print(f"[EDIT-{job_id}] Chamando {openai_model}...")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+
+        content = result["choices"][0]["message"]["content"]
+        # Limpar markdown se vier
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1]
+            content = content.rsplit("```", 1)[0]
+
+        edit_plan = json.loads(content)
+        print(f"[EDIT-{job_id}] IA retornou plano com {len(edit_plan.get('cuts', []))} cortes e {len(edit_plan.get('zooms', []))} zooms")
+        return edit_plan
+
+    except Exception as e:
+        print(f"[EDIT-{job_id}] IA falhou: {e}")
+        # Fallback: detectar silêncios automaticamente sem IA
+        return _fallback_detect_silences(transcript, video_duration, silence_threshold)
+
+
+def _fallback_detect_silences(transcript: list, video_duration: float, threshold: float) -> dict:
+    """Detecta silêncios baseado nos gaps entre segmentos (sem IA)."""
+    cuts = []
+    for i in range(len(transcript) - 1):
+        gap_start = transcript[i]["end"]
+        gap_end = transcript[i + 1]["start"]
+        gap = gap_end - gap_start
+        if gap >= threshold:
+            # Manter 0.1s de respiro nas bordas
+            cuts.append({
+                "start": round(gap_start + 0.1, 3),
+                "end": round(gap_end - 0.1, 3),
+                "reason": f"silêncio ({gap:.1f}s)",
+            })
+    return {"cuts": cuts, "zooms": []}
+
+
+# ─── FFmpeg Execution ─────────────────────────────────────────────
+
+def _execute_edits(input_path: str, output_path: str, edit_plan: dict, job_id: str):
+    """Executa cortes e zooms via FFmpeg."""
+
+    cuts = edit_plan.get("cuts", [])
+    zooms = edit_plan.get("zooms", [])
+
+    # Se não tem edições, copiar o arquivo
+    if not cuts and not zooms:
+        print(f"[EDIT-{job_id}] Nenhuma edição — copiando original")
+        shutil.copy2(input_path, output_path)
+        return
+
+    # Obter duração total
+    duration = _get_video_duration(input_path)
+
+    # ─── Montar filter_complex ───
+    filter_parts = []
+
+    # 1. Zoom filters
+    if zooms:
+        zoom_filter = _build_zoom_filter(zooms, duration)
+        if zoom_filter:
+            filter_parts.append(zoom_filter)
+
+    # 2. Cortes (trim + concat)
+    if cuts:
+        _execute_cuts_and_zooms(input_path, output_path, cuts, zooms, duration, job_id)
+        return
+
+    # Só zooms, sem cortes
+    if zooms and not cuts:
+        _execute_zooms_only(input_path, output_path, zooms, duration, job_id)
+        return
+
+    shutil.copy2(input_path, output_path)
+
+
+def _execute_cuts_and_zooms(
+    input_path: str, output_path: str, cuts: list, zooms: list, duration: float, job_id: str
+):
+    """Remove silêncios e aplica zooms."""
+
+    # Calcular os segmentos a MANTER (inverso dos cortes)
+    cuts_sorted = sorted(cuts, key=lambda c: c["start"])
+    keep_segments = []
+    current = 0.0
+
+    for cut in cuts_sorted:
+        cut_start = max(0, cut["start"])
+        cut_end = min(duration, cut["end"])
+        if cut_start > current:
+            keep_segments.append({"start": current, "end": cut_start})
+        current = cut_end
+
+    if current < duration:
+        keep_segments.append({"start": current, "end": duration})
+
+    if not keep_segments:
+        print(f"[EDIT-{job_id}] Nenhum segmento restante após cortes!")
+        shutil.copy2(input_path, output_path)
+        return
+
+    print(f"[EDIT-{job_id}] Mantendo {len(keep_segments)} segmentos, removendo {len(cuts_sorted)} cortes")
+
+    # Montar filter_complex com trim + concat
+    n = len(keep_segments)
+    filters = []
+    streams_v = []
+    streams_a = []
+
+    for i, seg in enumerate(keep_segments):
+        # Video trim
+        vf = f"[0:v]trim=start={seg['start']:.3f}:end={seg['end']:.3f},setpts=PTS-STARTPTS"
+
+        # Aplicar zoom se houver sobreposição
+        zoom = _find_zoom_for_segment(seg, zooms)
+        if zoom:
+            scale = zoom.get("scale", 1.15)
+            cx = zoom.get("center_x", 0.5)
+            cy = zoom.get("center_y", 0.4)
+            # Zoom com crop centralizado
+            vf += f",scale=iw*{scale}:ih*{scale}"
+            offset_x = f"(iw-ow)*{cx}"
+            offset_y = f"(ih-oh)*{cy}"
+            vf += f",crop=iw/{scale}:ih/{scale}:{offset_x}:{offset_y}"
+
+        vf += f"[v{i}]"
+        filters.append(vf)
+        streams_v.append(f"[v{i}]")
+
+        # Audio trim
+        af = f"[0:a]atrim=start={seg['start']:.3f}:end={seg['end']:.3f},asetpts=PTS-STARTPTS[a{i}]"
+        filters.append(af)
+        streams_a.append(f"[a{i}]")
+
+    # Concat
+    concat_in = "".join(streams_v) + "".join(streams_a)
+    filters.append(f"{concat_in}concat=n={n}:v=1:a=1[outv][outa]")
+
+    filter_complex = ";\n".join(filters)
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-filter_complex", filter_complex,
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    print(f"[EDIT-{job_id}] Executando FFmpeg com {n} segmentos...")
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+    if proc.returncode != 0:
+        print(f"[EDIT-{job_id}] FFmpeg erro: {proc.stderr[-500:]}")
+        # Fallback: tentar sem zoom
+        _execute_cuts_only(input_path, output_path, keep_segments, job_id)
+
+
+def _execute_cuts_only(input_path: str, output_path: str, keep_segments: list, job_id: str):
+    """Fallback: só cortes, sem zoom."""
+    n = len(keep_segments)
+    filters = []
+    streams_v = []
+    streams_a = []
+
+    for i, seg in enumerate(keep_segments):
+        filters.append(f"[0:v]trim=start={seg['start']:.3f}:end={seg['end']:.3f},setpts=PTS-STARTPTS[v{i}]")
+        filters.append(f"[0:a]atrim=start={seg['start']:.3f}:end={seg['end']:.3f},asetpts=PTS-STARTPTS[a{i}]")
+        streams_v.append(f"[v{i}]")
+        streams_a.append(f"[a{i}]")
+
+    concat_in = "".join(streams_v) + "".join(streams_a)
+    filters.append(f"{concat_in}concat=n={n}:v=1:a=1[outv][outa]")
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-filter_complex", ";\n".join(filters),
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ]
+
+    print(f"[EDIT-{job_id}] FFmpeg fallback (sem zoom)...")
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0:
+        print(f"[EDIT-{job_id}] FFmpeg fallback falhou: {proc.stderr[-300:]}")
+
+
+def _execute_zooms_only(input_path: str, output_path: str, zooms: list, duration: float, job_id: str):
+    """Só zooms, sem cortes."""
+    # Construir filtro zoompan dinâmico
+    zoom_filters = []
+    for z in zooms:
+        scale = z.get("scale", 1.15)
+        start = z.get("start", 0)
+        end = z.get("end", start + 1)
+        cx = z.get("center_x", 0.5)
+        cy = z.get("center_y", 0.4)
+
+        # Usar crop pra simular zoom
+        zoom_filters.append(
+            f"between(t,{start:.3f},{end:.3f})"
+        )
+
+    if not zoom_filters:
+        shutil.copy2(input_path, output_path)
+        return
+
+    # Simplificação: aplicar zooms via crop com enable
+    filter_parts = []
+    base = "[0:v]split={n}".format(n=len(zooms) + 1)
+
+    # Abordagem simples: zoom mais forte no segmento inteiro
+    z = zooms[0]  # Primeiro zoom como teste
+    scale = z.get("scale", 1.15)
+
+    # Um filtro de zoom suave com zoompan
+    vf = (
+        f"zoompan=z='if(between(on,0,1),{scale},{scale})':"
+        f"d=1:s=1080x1920:fps=30"
+    )
+
+    # Usar abordagem mais simples: scale + crop por segmento
+    enables = []
+    for z in zooms:
+        enables.append(f"between(t\\,{z['start']:.2f}\\,{z['end']:.2f})")
+
+    enable_expr = "+".join(enables)
+    scale_val = zooms[0].get("scale", 1.15)
+
+    vf = (
+        f"[0:v]scale=iw*{scale_val}:ih*{scale_val},"
+        f"crop=iw/{scale_val}:ih/{scale_val}:(iw-ow)/2:(ih-oh)/2:"
+        f"enable='{enable_expr}'[outv]"
+    )
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-filter_complex", vf,
+        "-map", "[outv]", "-map", "0:a",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "copy",
+        output_path,
+    ]
+
+    print(f"[EDIT-{job_id}] FFmpeg zooms only...")
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0:
+        print(f"[EDIT-{job_id}] Zoom falhou: {proc.stderr[-300:]}")
+        shutil.copy2(input_path, output_path)
+
+
+def _find_zoom_for_segment(segment: dict, zooms: list) -> dict | None:
+    """Encontra zoom que sobrepõe com o segmento."""
+    for z in zooms:
+        # Se o zoom sobrepõe com o segmento
+        if z["start"] < segment["end"] and z["end"] > segment["start"]:
+            return z
+    return None
+
+
+def _build_zoom_filter(zooms: list, duration: float) -> str:
+    """Constrói filtro de zoom (placeholder)."""
+    return ""
+
+
 # ─── Main endpoint ────────────────────────────────────────────────
 
 @app.post("/caption")
