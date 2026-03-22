@@ -20,7 +20,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-app = FastAPI(title="pycaps-api", version="3.0.0")
+app = FastAPI(title="pycaps-api", version="3.1.0")
 
 WORK_DIR = Path("/tmp/pycaps-work")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -104,7 +104,7 @@ async def edit_video(
     add_zooms: bool = Form(default=True, description="Adicionar zooms dinâmicos"),
     zoom_intensity: float = Form(default=1.15, description="Intensidade do zoom"),
     custom_prompt: str = Form(default="", description="Instrução extra pra IA editora"),
-    speed_factor: float = Form(default=1.0, description="Velocidade do vídeo. 1.0 = normal, 1.2 = 20% mais rápido, 1.5 = 50% mais rápido. Range: 0.5 a 2.0"),
+    speed_factor: float = Form(default=1.0, description="Velocidade do vídeo. 1.0 = normal"),
 ):
     job_id = str(uuid.uuid4())[:8]
     job_dir = WORK_DIR / f"edit_{job_id}"
@@ -115,11 +115,9 @@ async def edit_video(
     start_time = time.time()
 
     try:
-        # 1. Obter vídeo
         await _save_input(video, video_url, input_path, f"EDIT-{job_id}")
 
-        # 2. Aplicar velocidade (antes de tudo para timestamps ficarem corretos)
-        speed_factor = max(0.5, min(2.0, speed_factor))  # clamp 0.5x ~ 2.0x
+        speed_factor = max(0.5, min(2.0, speed_factor))
         if speed_factor != 1.0:
             sped_path = job_dir / "sped.mp4"
             _apply_speed(str(input_path), str(sped_path), speed_factor, job_id)
@@ -129,22 +127,18 @@ async def edit_video(
             else:
                 print(f"[EDIT-{job_id}] Velocidade falhou, usando original")
 
-        # 3. Info do vídeo
         video_info = _get_video_info(str(input_path))
         duration = video_info["duration"]
         print(f"[EDIT-{job_id}] Vídeo: {duration:.1f}s, {video_info['width']}x{video_info['height']}")
 
-        # 4. Detectar silêncios
         silences = []
         if remove_silence:
             silences = _detect_silences(str(input_path), silence_db, silence_threshold)
             print(f"[EDIT-{job_id}] {len(silences)} silêncios detectados")
 
-        # 5. Transcrever
         transcript = _whisper_transcribe(str(input_path), job_id)
         print(f"[EDIT-{job_id}] Transcrição: {len(transcript.get('segments', []))} segmentos")
 
-        # 6. IA gera plano
         edit_plan = _ai_edit_plan(
             transcript=transcript, silences=silences, duration=duration,
             zoom_intensity=zoom_intensity, openai_key=openai_api_key,
@@ -156,7 +150,6 @@ async def edit_video(
         zooms = edit_plan.get("zooms", [])
         print(f"[EDIT-{job_id}] Plano: {len(cuts)} cortes, {len(zooms)} zooms")
 
-        # 7. FFmpeg cortes + zooms
         _apply_edits(str(input_path), str(output_path), cuts, zooms, video_info, job_id)
 
         if not output_path.exists():
@@ -220,10 +213,8 @@ async def caption_video(
     start_time = time.time()
 
     try:
-        # 1. Obter vídeo
         await _save_input(video, video_url, input_path, f"CAP-{job_id}")
 
-        # 2. CSS
         css_content = custom_css if custom_css.strip() else _build_css(
             font_size=font_size, font_color=font_color, font_family=font_family,
             font_weight=font_weight, highlight_color=highlight_color,
@@ -232,7 +223,6 @@ async def caption_video(
         )
         css_path.write_text(css_content)
 
-        # 3. Config
         config = {
             "css": "style.css",
             "whisper": {"model": whisper_model, "language": language},
@@ -244,7 +234,6 @@ async def caption_video(
         config_path.write_text(json.dumps(config, indent=2))
         print(f"[CAP-{job_id}] Config: pos={position}({position_offset}), font={font_size}px")
 
-        # 4. Pycaps
         result = _run_pycaps(str(input_path), str(output_path), str(job_dir), template, job_id)
         if not result["success"]:
             raise HTTPException(status_code=500, detail=f"pycaps: {result.get('error')}")
@@ -302,16 +291,6 @@ def _download_file(url, output_path):
 # ═══════════════════════════════════════════════════════════════════
 
 def _apply_speed(input_path, output_path, speed_factor, job_id):
-    """
-    Acelera ou desacelera o vídeo mantendo qualidade de áudio.
-    atempo suporta apenas 0.5x ~ 2.0x por estágio — encadeia filtros se necessário.
-    Valores úteis:
-      1.1 = leve aceleração (fala um pouco lenta)
-      1.2 = aceleração suave (fala moderadamente lenta)
-      1.3 = aceleração média
-      1.5 = aceleração forte
-    """
-    # Construir cadeia de filtros atempo (max 2.0x por estágio)
     atempo_filters = []
     remaining = speed_factor
     while remaining > 2.0:
@@ -480,7 +459,6 @@ def _apply_edits(input_path, output_path, cuts, zooms, video_info, job_id):
     if not cuts and not zooms:
         shutil.copy2(input_path, output_path); return
 
-    # Passo 1: Cortar silêncios
     cut_path = input_path
     if cuts:
         speech = _speech_segments(cuts, duration)
@@ -502,7 +480,6 @@ def _apply_edits(input_path, output_path, cuts, zooms, video_info, job_id):
             print(f"[EDIT-{job_id}] Corte falhou: {proc.stderr[-300:]}")
             cut_path = input_path
 
-    # Passo 2: Zooms
     if zooms:
         source = cut_path
         zoom_expr = "1"
@@ -542,7 +519,7 @@ def _speech_segments(cuts, duration):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# HELPERS — Pycaps
+# HELPERS — Pycaps (FIX: layout position)
 # ═══════════════════════════════════════════════════════════════════
 
 def _run_pycaps(input_path, output_path, job_dir, template, job_id):
@@ -555,15 +532,101 @@ import sys, json
 from pathlib import Path
 try:
     from pycaps import CapsPipelineBuilder, TemplateLoader
+
+    # Carrega template e input
     builder = TemplateLoader("{template}").with_input_video("{input_path}").load(False)
+
+    # Aplica CSS customizado
     css = Path("{css_path}")
-    if css.exists(): builder.add_css_content(css.read_text())
+    if css.exists():
+        builder.add_css_content(css.read_text())
+
+    # Carrega config
     cfg = Path("{config_path}")
+    layout = {{}}
     if cfg.exists():
         c = json.loads(cfg.read_text())
-        if hasattr(builder, "with_layout"): builder.with_layout(c.get("layout", {{}}))
-    builder.build().run()
+        layout = c.get("layout", {{}})
+
+    # DEBUG: lista todos os métodos do builder
+    builder_methods = [m for m in dir(builder) if not m.startswith("_")]
+    print(f"BUILDER_METHODS: {{builder_methods}}")
+
+    # Tenta aplicar layout de várias formas
+    applied = False
+
+    # Forma 1: with_layout
+    if hasattr(builder, "with_layout"):
+        try:
+            builder.with_layout(layout)
+            print(f"Layout aplicado via with_layout: {{layout}}")
+            applied = True
+        except Exception as e:
+            print(f"with_layout falhou: {{e}}")
+
+    # Forma 2: layout direto
+    if not applied and hasattr(builder, "layout"):
+        try:
+            builder.layout = layout
+            print(f"Layout aplicado via builder.layout = ...")
+            applied = True
+        except Exception as e:
+            print(f"builder.layout falhou: {{e}}")
+
+    # Forma 3: with_max_width_ratio e with_vertical_align separados
+    if hasattr(builder, "with_max_width_ratio"):
+        try:
+            builder.with_max_width_ratio(layout.get("max_width_ratio", 0.85))
+            print(f"max_width_ratio aplicado")
+        except Exception as e:
+            print(f"with_max_width_ratio falhou: {{e}}")
+
+    if hasattr(builder, "with_max_number_of_lines"):
+        try:
+            builder.with_max_number_of_lines(layout.get("max_number_of_lines", 2))
+            print(f"max_number_of_lines aplicado")
+        except Exception as e:
+            print(f"with_max_number_of_lines falhou: {{e}}")
+
+    if hasattr(builder, "with_vertical_align"):
+        try:
+            va = layout.get("vertical_align", {{}})
+            builder.with_vertical_align(va.get("align", "center"), va.get("offset", 0.2))
+            print(f"vertical_align aplicado: {{va}}")
+            applied = True
+        except Exception as e:
+            print(f"with_vertical_align falhou: {{e}}")
+
+    # Build pipeline
+    pipeline = builder.build()
+
+    # DEBUG: lista métodos do pipeline
+    pipeline_methods = [m for m in dir(pipeline) if not m.startswith("_")]
+    print(f"PIPELINE_METHODS: {{pipeline_methods}}")
+
+    # Tenta setar layout no pipeline também
+    if hasattr(pipeline, "layout"):
+        try:
+            pipeline.layout = layout
+            print(f"Layout aplicado via pipeline.layout")
+        except Exception as e:
+            print(f"pipeline.layout falhou: {{e}}")
+
+    if hasattr(pipeline, "config"):
+        try:
+            if hasattr(pipeline.config, "layout"):
+                pipeline.config.layout = layout
+                print(f"Layout aplicado via pipeline.config.layout")
+        except Exception as e:
+            print(f"pipeline.config.layout falhou: {{e}}")
+
+    if not applied:
+        print(f"AVISO: Nenhum metodo de layout funcionou. Layout: {{layout}}")
+
+    # Executa
+    pipeline.run()
     print("SUCCESS")
+
 except Exception as e:
     print(f"ERROR: {{e}}", file=sys.stderr)
     import traceback; traceback.print_exc(file=sys.stderr)
@@ -574,8 +637,8 @@ except Exception as e:
 
     try:
         proc = subprocess.run([sys.executable, str(script_path)], capture_output=True, text=True, timeout=600, cwd=job_dir)
-        if proc.stdout: print(f"[CAP-{job_id}] stdout: {proc.stdout[-300:]}")
-        if proc.stderr: print(f"[CAP-{job_id}] stderr: {proc.stderr[-300:]}")
+        if proc.stdout: print(f"[CAP-{job_id}] stdout: {proc.stdout}")
+        if proc.stderr: print(f"[CAP-{job_id}] stderr: {proc.stderr[-500:]}")
         out = _find_output(Path(output_path), Path(job_dir))
         if proc.returncode == 0 and out:
             if str(out) != output_path: shutil.move(str(out), output_path)
