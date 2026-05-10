@@ -25,6 +25,96 @@ app = FastAPI(title="pycaps-api", version="3.1.0")
 WORK_DIR = Path("/tmp/pycaps-work")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
+CAPTION_LOCKED_LAYOUT = {
+    "position": "bottom",
+    "position_offset": 0.24,
+    "max_width": 0.76,
+    "max_lines": 2,
+}
+
+CAPTION_STYLE_PRESETS = {
+    "capcut_clean": {
+        "label": "CapCut Clean",
+        "template": "minimalist",
+        "layout": CAPTION_LOCKED_LAYOUT,
+        "css": {
+            "font_size": 56,
+            "font_color": "white",
+            "font_family": "Arial Black",
+            "font_weight": 900,
+            "highlight_color": "white",
+            "highlight_bg": "",
+            "text_transform": "none",
+            "stroke_color": "black",
+            "stroke_width": "3px",
+        },
+    },
+    "minimalist": {
+        "label": "Minimalist",
+        "template": "minimalist",
+        "layout": CAPTION_LOCKED_LAYOUT,
+        "css": {
+            "font_size": 52,
+            "font_color": "white",
+            "font_family": "Inter",
+            "font_weight": 850,
+            "highlight_color": "white",
+            "highlight_bg": "",
+            "text_transform": "none",
+            "stroke_color": "black",
+            "stroke_width": "3px",
+        },
+    },
+    "karaoke_yellow": {
+        "label": "Karaoke Yellow",
+        "template": "minimalist",
+        "layout": CAPTION_LOCKED_LAYOUT,
+        "css": {
+            "font_size": 56,
+            "font_color": "white",
+            "font_family": "Arial Black",
+            "font_weight": 900,
+            "highlight_color": "#facc15",
+            "highlight_bg": "",
+            "text_transform": "none",
+            "stroke_color": "black",
+            "stroke_width": "3px",
+        },
+    },
+    "bold_quote": {
+        "label": "Bold Quote",
+        "template": "minimalist",
+        "layout": CAPTION_LOCKED_LAYOUT,
+        "css": {
+            "font_size": 54,
+            "font_color": "white",
+            "font_family": "Montserrat",
+            "font_weight": 900,
+            "highlight_color": "white",
+            "highlight_bg": "",
+            "text_transform": "none",
+            "stroke_color": "black",
+            "stroke_width": "3px",
+        },
+    },
+    "hook_yellow": {
+        "label": "Hook Yellow",
+        "template": "minimalist",
+        "layout": CAPTION_LOCKED_LAYOUT,
+        "css": {
+            "font_size": 58,
+            "font_color": "#facc15",
+            "font_family": "Arial Black",
+            "font_weight": 900,
+            "highlight_color": "#facc15",
+            "highlight_bg": "",
+            "text_transform": "none",
+            "stroke_color": "black",
+            "stroke_width": "3px",
+        },
+    },
+}
+
 
 # ═══════════════════════════════════════════════════════════════════
 # STARTUP & UTILS
@@ -85,7 +175,15 @@ async def list_templates():
     builtin = ["minimalist", "default"]
     custom_dir = Path("/app/templates")
     custom = [d.name for d in custom_dir.iterdir() if d.is_dir()] if custom_dir.exists() else []
-    return {"builtin": builtin, "custom": custom}
+    caption_styles = {
+        name: {
+            "label": preset["label"],
+            "template": preset["template"],
+            "layout": preset["layout"],
+        }
+        for name, preset in CAPTION_STYLE_PRESETS.items()
+    }
+    return {"builtin": builtin, "custom": custom, "caption_styles": caption_styles}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -96,7 +194,7 @@ async def list_templates():
 async def edit_video(
     video: UploadFile = File(default=None, description="Vídeo MP4"),
     video_url: str = Form(default="", description="URL do vídeo (alternativa ao upload)"),
-    openai_api_key: str = Form(..., description="API Key da OpenAI"),
+    openai_api_key: str = Form(default="", description="API Key da OpenAI"),
     openai_model: str = Form(default="gpt-4o", description="Modelo OpenAI"),
     remove_silence: bool = Form(default=True, description="Remover silêncios"),
     silence_threshold: float = Form(default=0.4, description="Duração mín de silêncio pra cortar (s)"),
@@ -116,6 +214,7 @@ async def edit_video(
 
     try:
         await _save_input(video, video_url, input_path, f"EDIT-{job_id}")
+        openai_api_key = _resolve_openai_api_key(openai_api_key)
 
         speed_factor = max(0.5, min(2.0, speed_factor))
         if speed_factor != 1.0:
@@ -185,6 +284,7 @@ async def caption_video(
     video: UploadFile = File(default=None, description="Vídeo MP4"),
     video_url: str = Form(default="", description="URL do vídeo"),
     template: str = Form(default="minimalist"),
+    caption_style: str = Form(default="capcut_clean"),
     language: str = Form(default="pt"),
     whisper_model: str = Form(default="small"),
     position: str = Form(default="center"),
@@ -215,6 +315,30 @@ async def caption_video(
     try:
         await _save_input(video, video_url, input_path, f"CAP-{job_id}")
 
+        preset = _resolve_caption_style(caption_style, template)
+        if preset:
+            template = preset["template"]
+            layout_preset = preset["layout"]
+            position = layout_preset.get("position", position)
+            position_offset = layout_preset.get("position_offset", position_offset)
+            max_width = layout_preset.get("max_width", max_width)
+            max_lines = layout_preset.get("max_lines", max_lines)
+            css_preset = preset["css"]
+            font_size = css_preset.get("font_size", font_size)
+            font_color = css_preset.get("font_color", font_color)
+            font_family = css_preset.get("font_family", font_family)
+            font_weight = css_preset.get("font_weight", font_weight)
+            highlight_color = css_preset.get("highlight_color", highlight_color)
+            highlight_bg = css_preset.get("highlight_bg", highlight_bg)
+            text_transform = css_preset.get("text_transform", text_transform)
+            stroke_color = css_preset.get("stroke_color", stroke_color)
+            stroke_width = css_preset.get("stroke_width", stroke_width)
+
+        position = CAPTION_LOCKED_LAYOUT["position"]
+        position_offset = CAPTION_LOCKED_LAYOUT["position_offset"]
+        max_width = CAPTION_LOCKED_LAYOUT["max_width"]
+        max_lines = CAPTION_LOCKED_LAYOUT["max_lines"]
+
         css_content = custom_css if custom_css.strip() else _build_css(
             font_size=font_size, font_color=font_color, font_family=font_family,
             font_weight=font_weight, highlight_color=highlight_color,
@@ -232,7 +356,7 @@ async def caption_video(
             },
         }
         config_path.write_text(json.dumps(config, indent=2))
-        print(f"[CAP-{job_id}] Config: pos={position}({position_offset}), font={font_size}px")
+        print(f"[CAP-{job_id}] Config: style={caption_style}, template={template}, pos={position}({position_offset}), font={font_size}px")
 
         result = _run_pycaps(str(input_path), str(output_path), str(job_dir), template, job_id)
         if not result["success"]:
@@ -396,6 +520,10 @@ print(json.dumps(output, ensure_ascii=False))
 
 def _ai_edit_plan(transcript, silences, duration, zoom_intensity, openai_key, openai_model, add_zooms, custom_prompt, job_id):
     import urllib.request
+
+    if not openai_key:
+        print(f"[EDIT-{job_id}] OpenAI key ausente, usando fallback")
+        return _fallback_plan(silences, duration, zoom_intensity, add_zooms)
 
     txt = ""
     for seg in transcript.get("segments", []):
@@ -659,19 +787,34 @@ except Exception as e:
     return {"success": False, "error": f"CLI exit {proc.returncode}"}
 
 
+def _resolve_caption_style(caption_style, template):
+    if caption_style in CAPTION_STYLE_PRESETS:
+        return CAPTION_STYLE_PRESETS[caption_style]
+    if template in CAPTION_STYLE_PRESETS:
+        return CAPTION_STYLE_PRESETS[template]
+    return CAPTION_STYLE_PRESETS["capcut_clean"]
+
+
+def _resolve_openai_api_key(form_value: str = ""):
+    return (form_value or os.getenv("OPENAI_API_KEY") or "").strip()
+
+
 def _build_css(font_size, font_color, font_family, font_weight, highlight_color, highlight_bg, text_transform, stroke_color, stroke_width):
     sw = int(stroke_width.replace("px", "").strip() or "1")
     shadows = [f"{dx}px {dy}px 0 {stroke_color}" for dx in range(-sw, sw+1) for dy in range(-sw, sw+1) if dx or dy]
-    shadows.append("2px 2px 4px rgba(0,0,0,0.8)")
+    shadows.append("0 4px 10px rgba(0,0,0,0.65)")
     hl = f"\n    background-color: {highlight_bg};\n    border-radius: 4px;\n    padding: 2px 6px;" if highlight_bg.strip() else ""
     return f""".word {{
     font-family: {font_family}, sans-serif;
     font-weight: {font_weight};
     font-size: {font_size}px;
+    line-height: 1.08;
+    letter-spacing: 0;
     color: {font_color};
     text-transform: {text_transform};
-    padding: 2px 4px;
+    padding: 0 3px;
     text-shadow: {', '.join(shadows)};
+    text-align: center;
 }}
 .word-being-narrated {{
     color: {highlight_color};{hl}
