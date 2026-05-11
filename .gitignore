@@ -1,0 +1,12 @@
+*_audio.mp3
+*_captions.ass
+*_editado_*.mp4
+*_editado_*.jpg
+*_filter_complex.txt
+*_keep_segments.json
+*_plan_request.json
+*_plan_response.json
+*_preview_*.jpg
+*_silence.log
+*_transcript.json
+work/

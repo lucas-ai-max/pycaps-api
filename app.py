@@ -15,6 +15,7 @@ import sys
 import time
 import traceback
 import uuid
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -386,6 +387,102 @@ async def caption_video(
 # HELPERS — Input
 # ═══════════════════════════════════════════════════════════════════
 
+@app.post("/clips")
+async def create_clips(
+    video: UploadFile = File(default=None, description="VÃ­deo MP4"),
+    video_url: str = Form(default="", description="URL do vÃ­deo"),
+    openai_api_key: str = Form(default="", description="API Key da OpenAI"),
+    openai_model: str = Form(default="gpt-4o", description="Modelo OpenAI"),
+    num_clips: int = Form(default=5, description="Quantidade de clipes"),
+    min_duration: float = Form(default=18.0, description="DuraÃ§Ã£o mÃ­nima por clipe"),
+    max_duration: float = Form(default=60.0, description="DuraÃ§Ã£o mÃ¡xima por clipe"),
+    add_captions: bool = Form(default=True, description="Adicionar legenda aos clipes"),
+    caption_style: str = Form(default="capcut_clean", description="Estilo de legenda"),
+    language: str = Form(default="pt"),
+    whisper_model: str = Form(default="small"),
+    custom_prompt: str = Form(default="", description="CritÃ©rios extras para escolher clipes"),
+):
+    job_id = str(uuid.uuid4())[:8]
+    job_dir = WORK_DIR / f"clips_{job_id}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    input_path = job_dir / "input.mp4"
+    zip_path = job_dir / "clips.zip"
+    start_time = time.time()
+
+    try:
+        await _save_input(video, video_url, input_path, f"CLIPS-{job_id}")
+        openai_api_key = _resolve_openai_api_key(openai_api_key)
+
+        num_clips = max(1, min(12, num_clips))
+        min_duration = max(8.0, min(90.0, min_duration))
+        max_duration = max(min_duration, min(180.0, max_duration))
+
+        video_info = _get_video_info(str(input_path))
+        transcript = _whisper_transcribe(str(input_path), job_id)
+        clip_plan = _ai_clip_plan(
+            transcript=transcript,
+            duration=video_info["duration"],
+            openai_key=openai_api_key,
+            openai_model=openai_model,
+            num_clips=num_clips,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            custom_prompt=custom_prompt,
+            job_id=job_id,
+        )
+        clips = _sanitize_clip_plan(clip_plan.get("clips", []), video_info["duration"], min_duration, max_duration, num_clips)
+        if not clips:
+            raise HTTPException(status_code=500, detail="Nenhum clipe encontrado")
+
+        rendered = []
+        for idx, clip in enumerate(clips, 1):
+            raw_path = job_dir / f"clip_{idx:02d}_raw.mp4"
+            final_path = job_dir / f"clip_{idx:02d}.mp4"
+            _cut_clip(str(input_path), str(raw_path), clip["start"], clip["end"], job_id, idx)
+
+            if add_captions:
+                cap_dir = job_dir / f"cap_{idx:02d}"
+                cap_dir.mkdir(parents=True, exist_ok=True)
+                template = _write_caption_assets(cap_dir, caption_style, "minimalist", whisper_model, language)
+                result = _run_pycaps(str(raw_path), str(final_path), str(cap_dir), template, f"{job_id}-{idx:02d}")
+                if not result["success"] or not final_path.exists():
+                    print(f"[CLIPS-{job_id}] Legenda falhou no clipe {idx}, usando clipe sem legenda")
+                    shutil.copy2(raw_path, final_path)
+            else:
+                shutil.copy2(raw_path, final_path)
+
+            clip["file"] = final_path.name
+            clip["duration"] = round(clip["end"] - clip["start"], 2)
+            rendered.append({"path": final_path, "meta": clip})
+
+        metadata = {
+            "job_id": job_id,
+            "source_duration": round(video_info["duration"], 2),
+            "elapsed": round(time.time() - start_time, 2),
+            "clips": [item["meta"] for item in rendered],
+        }
+        (job_dir / "clips.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
+
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(job_dir / "clips.json", "clips.json")
+            for item in rendered:
+                zf.write(item["path"], item["path"].name)
+
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"clips_{job_id}.zip",
+            headers={"X-Clips-Count": str(len(rendered))},
+            background=_cleanup_bg(job_dir),
+        )
+    except HTTPException:
+        _cleanup_dir(job_dir); raise
+    except Exception as e:
+        _cleanup_dir(job_dir); traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 async def _save_input(video, video_url, input_path, tag):
     if video and video.filename:
         content = await video.read()
@@ -517,6 +614,159 @@ print(json.dumps(output, ensure_ascii=False))
 # ═══════════════════════════════════════════════════════════════════
 # HELPERS — AI Edit Plan
 # ═══════════════════════════════════════════════════════════════════
+
+def _ai_clip_plan(transcript, duration, openai_key, openai_model, num_clips, min_duration, max_duration, custom_prompt, job_id):
+    import urllib.request
+
+    if not openai_key:
+        print(f"[CLIPS-{job_id}] OpenAI key ausente, usando fallback")
+        return _fallback_clip_plan(transcript, duration, num_clips, min_duration, max_duration)
+
+    timeline = _transcript_timeline(transcript, max_chars=24000)
+    prompt = f"""VocÃª Ã© um editor especialista em criar cortes virais para Reels, TikTok e Shorts, no estilo Opus Clip.
+
+OBJETIVO:
+Escolha os {num_clips} melhores clipes independentes deste vÃ­deo.
+
+VÃDEO:
+DuraÃ§Ã£o total: {duration:.1f}s
+DuraÃ§Ã£o por clipe: entre {min_duration:.0f}s e {max_duration:.0f}s
+
+TRANSCRIÃ‡ÃƒO COM TIMESTAMPS:
+{timeline}
+
+CRITÃ‰RIOS:
+1. Comece em um gancho forte, sem depender de contexto anterior.
+2. Termine em uma conclusÃ£o natural, frase de impacto ou virada.
+3. Priorize valor claro, emoÃ§Ã£o, opiniÃ£o forte, histÃ³ria ou promessa.
+4. Evite comeÃ§ar no meio de uma palavra/frase.
+5. DÃª score de 0 a 100 considerando hook, clareza, retenÃ§Ã£o e potencial de compartilhamento.
+{f"6. CritÃ©rio extra do usuÃ¡rio: {custom_prompt}" if custom_prompt else ""}
+
+Responda APENAS JSON vÃ¡lido, sem markdown:
+{{"clips":[{{"start":12.3,"end":45.6,"title":"tÃ­tulo curto","score":91,"reason":"por que esse trecho funciona"}}]}}"""
+
+    body = json.dumps({
+        "model": openai_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.25,
+        "max_tokens": 2500,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {openai_key}"},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read())
+        content = data["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"): content = "\n".join(content.split("\n")[1:])
+        if content.endswith("```"): content = "\n".join(content.split("\n")[:-1])
+        plan = json.loads(content)
+        print(f"[CLIPS-{job_id}] IA: {len(plan.get('clips', []))} clipes sugeridos")
+        return plan
+    except Exception as e:
+        print(f"[CLIPS-{job_id}] IA falhou ({e}), usando fallback")
+        return _fallback_clip_plan(transcript, duration, num_clips, min_duration, max_duration)
+
+
+def _fallback_clip_plan(transcript, duration, num_clips, min_duration, max_duration):
+    clips, current = [], None
+    for seg in transcript.get("segments", []):
+        if current is None:
+            current = {"start": float(seg.get("start", 0)), "end": float(seg.get("end", 0)), "text": seg.get("text", "").strip()}
+        else:
+            current["end"] = float(seg.get("end", current["end"]))
+            current["text"] = f"{current['text']} {seg.get('text', '').strip()}".strip()
+
+        clip_duration = current["end"] - current["start"]
+        sentence_end = current["text"].endswith((".", "!", "?"))
+        if clip_duration >= min_duration and (sentence_end or clip_duration >= max_duration):
+            clips.append({
+                "start": current["start"],
+                "end": min(current["end"], current["start"] + max_duration),
+                "title": current["text"][:70] or "Clip",
+                "score": max(50, 82 - len(clips) * 4),
+                "reason": "Fallback por bloco natural da transcriÃ§Ã£o",
+            })
+            current = None
+            if len(clips) >= num_clips:
+                break
+
+    if not clips:
+        end = min(duration, max_duration)
+        clips.append({"start": 0.0, "end": end, "title": "Clip principal", "score": 60, "reason": "Fallback sem transcriÃ§Ã£o suficiente"})
+    return {"clips": clips}
+
+
+def _sanitize_clip_plan(clips, duration, min_duration, max_duration, num_clips):
+    clean = []
+    for clip in clips:
+        try:
+            start = max(0.0, float(clip.get("start", 0)))
+            end = min(duration, float(clip.get("end", start + min_duration)))
+        except Exception:
+            continue
+
+        if end <= start:
+            continue
+        if end - start < min_duration:
+            end = min(duration, start + min_duration)
+        if end - start > max_duration:
+            end = start + max_duration
+        if end - start < 3:
+            continue
+
+        try:
+            score = int(float(clip.get("score", 60)))
+        except Exception:
+            score = 60
+
+        clean.append({
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "title": str(clip.get("title") or "Clip")[:90],
+            "score": max(0, min(100, score)),
+            "reason": str(clip.get("reason") or "")[:240],
+        })
+
+    clean.sort(key=lambda c: c["score"], reverse=True)
+    deduped = []
+    for clip in clean:
+        overlaps = any(not (clip["end"] <= kept["start"] or clip["start"] >= kept["end"]) for kept in deduped)
+        if not overlaps:
+            deduped.append(clip)
+        if len(deduped) >= num_clips:
+            break
+    return sorted(deduped, key=lambda c: c["start"])
+
+
+def _transcript_timeline(transcript, max_chars=24000):
+    lines = []
+    for seg in transcript.get("segments", []):
+        text = seg.get("text", "").strip()
+        if text:
+            lines.append(f"[{seg.get('start', 0):.1f}s - {seg.get('end', 0):.1f}s] {text}")
+    timeline = "\n".join(lines)
+    return timeline[:max_chars]
+
+
+def _cut_clip(input_path, output_path, start, end, job_id, index):
+    duration = max(0.1, end - start)
+    cmd = [
+        "ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", input_path,
+        "-t", f"{duration:.3f}",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ]
+    print(f"[CLIPS-{job_id}] Cortando clip {index}: {start:.2f}s-{end:.2f}s")
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0 or not Path(output_path).exists():
+        raise RuntimeError(f"FFmpeg falhou no clipe {index}: {proc.stderr[-400:]}")
+
 
 def _ai_edit_plan(transcript, silences, duration, zoom_intensity, openai_key, openai_model, add_zooms, custom_prompt, job_id):
     import urllib.request
@@ -797,6 +1047,38 @@ def _resolve_caption_style(caption_style, template):
 
 def _resolve_openai_api_key(form_value: str = ""):
     return (form_value or os.getenv("OPENAI_API_KEY") or "").strip()
+
+
+def _write_caption_assets(job_dir, caption_style, template, whisper_model, language):
+    preset = _resolve_caption_style(caption_style, template)
+    template = preset["template"]
+    css_preset = preset["css"]
+    css_content = _build_css(
+        font_size=css_preset.get("font_size", 56),
+        font_color=css_preset.get("font_color", "white"),
+        font_family=css_preset.get("font_family", "Arial Black"),
+        font_weight=css_preset.get("font_weight", 900),
+        highlight_color=css_preset.get("highlight_color", "white"),
+        highlight_bg=css_preset.get("highlight_bg", ""),
+        text_transform=css_preset.get("text_transform", "none"),
+        stroke_color=css_preset.get("stroke_color", "black"),
+        stroke_width=css_preset.get("stroke_width", "3px"),
+    )
+    config = {
+        "css": "style.css",
+        "whisper": {"model": whisper_model, "language": language},
+        "layout": {
+            "max_width_ratio": CAPTION_LOCKED_LAYOUT["max_width"],
+            "max_number_of_lines": CAPTION_LOCKED_LAYOUT["max_lines"],
+            "vertical_align": {
+                "align": CAPTION_LOCKED_LAYOUT["position"],
+                "offset": CAPTION_LOCKED_LAYOUT["position_offset"],
+            },
+        },
+    }
+    Path(job_dir, "style.css").write_text(css_content)
+    Path(job_dir, "pycaps.template.json").write_text(json.dumps(config, indent=2))
+    return template
 
 
 def _build_css(font_size, font_color, font_family, font_weight, highlight_color, highlight_bg, text_transform, stroke_color, stroke_width):
